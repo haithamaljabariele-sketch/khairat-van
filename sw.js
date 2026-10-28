@@ -1,7 +1,7 @@
 /* كاش فان — keeps the app itself on the phone so it opens without signal.
    The office data and every save go to the database (/rest/v1) and are NEVER cached here.
    Change CACHE when any file changes, so phones pick up the new version. */
-const CACHE = 'cashvan-web-v4';
+const CACHE = 'cashvan-web-v6';
 const SHELL = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png', './apple-touch-icon.png', './logo.png'];
 
 self.addEventListener('install', e => {

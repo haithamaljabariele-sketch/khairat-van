@@ -121,7 +121,7 @@ button,input,select,textarea{font-family:inherit}
 const Config = {
   URL: 'https://vyrgrxebuugqccqhgcjf.supabase.co',
   KEY: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZ5cmdyeGVidXVncWNjcWhnY2pmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTE5NzI1NzEsImV4cCI6MjEwNzU0ODU3MX0.eWqSC6jE0-lRiemgaCjso2_J_PjlX41jcxfk_Cyxeoc',
-  VERSION: '2.1',
+  VERSION: '2.3',
   COMPANY: 'شركة خيرات العز للدواجن والمجمدات',
   TAGLINE: 'لتجارة وتوزيع الدجاج الطازج والمجمد',
   OFFICE_PHONE: '0793056660'
@@ -490,10 +490,19 @@ class Summary {
   docs(kind) {
     const serverKey = { invoice: 'invoices', collection: 'collections', purchase: 'purchases', expense: 'expenses', deposit: 'deposits' }[kind] || '';
     const seen = new Set(); const l = [];
-    const deletedLocal = new Set(this.outs.filter(o => o.kind === 'delete_invoice').map(o => str(o.payload, 'id')));
+    const delKind = { invoice: 'delete_invoice', collection: 'delete_collection' }[kind];
+    const deletedLocal = new Set(this.outs.filter(o => o.kind === delKind).map(o => str(o.payload, 'id')));
+    // the latest edit of each document made on this phone (sent or not) wins over what the database last said
+    const edits = new Map();
+    for (const o of this.outs.filter(o => o.kind === 'edit_' + kind)) edits.set(str(o.payload, 'id'), o);
+    const withEdit = d => {
+      const e = edits.get(d.id); if (!e) return d;
+      return Object.assign(d, { title: e.title, amount: e.amount, sub: Summary.sub(kind, e.payload), json: Object.assign({}, d.json, e.payload), edited: true,
+        status: e.status === Store.SENT ? d.status : e.status, error: e.status === Store.FAILED ? e.error : d.error });
+    };
     for (const o of this.outs.filter(o => o.kind === kind)) {
       seen.add(o.id);
-      l.push(Doc(o.id, kind, o.title, Summary.sub(kind, o.payload), o.amount, true, o.status, o.error, o.payload, deletedLocal.has(o.id)));
+      l.push(withEdit(Doc(o.id, kind, o.title, Summary.sub(kind, o.payload), o.amount, true, o.status, o.error, o.payload, deletedLocal.has(o.id))));
     }
     const a = this.dayData ? this.dayData.arr(serverKey) : null;
     if (a) for (const j of a) {
@@ -504,8 +513,8 @@ class Summary {
         if (d && j.deleted === true) d.deleted = true;
         continue;
       }
-      if (kind === 'invoice') l.push(Doc(id, kind, str(j, 'number') + ' · ' + str(j, 'customer_name'), str(j, 'receipt_type'), num(j.total), false, 1, null, j, j.deleted === true || deletedLocal.has(id)));
-      else if (kind === 'collection') l.push(Doc(id, kind, (str(j, 'number') ? str(j, 'number') + ' · ' : '') + str(j, 'customer_name'), str(j, 'method'), num(j.amount), false, 1, null, j, j.deleted === true));
+      if (kind === 'invoice') l.push(withEdit(Doc(id, kind, str(j, 'number') + ' · ' + str(j, 'customer_name'), str(j, 'receipt_type'), num(j.total), false, 1, null, j, j.deleted === true || deletedLocal.has(id))));
+      else if (kind === 'collection') l.push(withEdit(Doc(id, kind, (str(j, 'number') ? str(j, 'number') + ' · ' : '') + str(j, 'customer_name'), str(j, 'method'), num(j.amount), false, 1, null, j, j.deleted === true || deletedLocal.has(id))));
       else if (kind === 'purchase') l.push(Doc(id, kind, str(j, 'company'), Fmt.kg(num(j.kg)) + ' كغم · ' + num(j.lines) + ' صنف', num(j.total), false, 1, null, j));
       else if (kind === 'expense') l.push(Doc(id, kind, str(j, 'category'), str(j, 'method'), num(j.amount), false, 1, null, j));
       else l.push(Doc(id, kind, str(j, 'kind') === 'cheque' ? 'إيداع شيكات' : 'إيداع نقدي', str(j, 'bank'), num(j.amount), false, 1, null, j));
@@ -574,7 +583,8 @@ function b64(buf) {
 const Sync = {
   sessionEnded: false, _chain: Promise.resolve(),
   FN: { invoice: 'app_save_invoice', collection: 'app_save_collection', purchase: 'app_save_purchase', transfer: 'app_save_transfer',
-        count: 'app_save_count', expense: 'app_save_expense', deposit: 'app_save_deposit', delete_invoice: 'app_delete_invoice' },
+        count: 'app_save_count', expense: 'app_save_expense', deposit: 'app_save_deposit', delete_invoice: 'app_delete_invoice',
+        edit_invoice: 'app_update_invoice', edit_collection: 'app_update_collection', delete_collection: 'app_delete_collection' },
   /** resolves to null on success or the message to show; a second caller waits for the run in progress */
   running: 0, PULL_EVERY_MS: 90000,
   busy(on) { Sync.running += on ? 1 : -1; let b = document.getElementById('busy'); if (!b) { b = document.createElement('div'); b.id = 'busy'; document.body.append(b); } b.classList.toggle('on', Sync.running > 0); },
@@ -604,7 +614,7 @@ const Sync = {
         const fn = Sync.FN[o.kind]; if (!fn) continue;
         const cur = Store.out(o.id); if (!cur || cur.status !== 0) continue;
         try {
-          if (o.kind === 'delete_invoice') await Api.call(fn, { p_token: tok, p_id: str(o.payload, 'id'), p_reason: str(o.payload, 'reason') });
+          if (o.kind === 'delete_invoice' || o.kind === 'delete_collection') await Api.call(fn, { p_token: tok, p_id: str(o.payload, 'id'), p_reason: str(o.payload, 'reason') });
           else await Api.call(fn, { p_token: tok, p: o.payload });
           await Store.markSent(o.id); sentAny = true;
         } catch (e) {
@@ -675,7 +685,20 @@ const Sync = {
   async fetchDay(day) {
     const d = await Api.obj('app_day', { p_token: Prefs.token, p_day: day }, 60000);
     await Store.setKv('day:' + day, JSON.stringify(d));
+    Sync.redrawSlips(day, d).catch(() => {});
     return new DayData(d);
+  },
+  /** invoices the office edited lose their stored slip; this phone draws the new one and sends it on the next run */
+  async redrawSlips(day, d) {
+    const mm = Master.load(); if (!mm || !mm.allowed('رفع صورة الفاتورة إلى OneDrive', true)) return;
+    let n = 0;
+    for (const j of (d.invoices || [])) {
+      if (j.edited !== true || j.has_photo === true || j.deleted === true) continue;
+      const id = str(j, 'id');
+      if (Store.photosFor('invoice', id).some(p => p.status !== Store.SENT || p.created_at > Date.now() - 3600000)) continue;   // already queued / just sent
+      try { await logoReady; const p = serverInvoiceOf(j, day); await keepReceiptImage('invoice', id, day, str(j, 'number') + ' · ' + str(j, 'customer_name'), await canvasBlob(Docs.invoice(mm, p))); n++; } catch (e) {}
+    }
+    if (n) Sync.run(false);
   }
 };
 
@@ -1480,9 +1503,22 @@ Screens.home = function () {
 Screens.sale = function (_, params) {
   const mm = Master.load();
   if (!mm) { toastLong('زامن أولاً'); Nav.finish(); return; }
-  const S = screen('فاتورة جديدة'); const b = S.body;
-  let customer = null; const lines = []; let credit = false; let day = Fmt.today(); let saved = false;
-  if (mm.allowed('اختيار التاريخ للمبيعات', false) || mm.allowed('السماح بإدخال فاتورة بتاريخ سابق', false)) {
+  // editing an existing invoice: ?edit=<id>&day=<day> (allowed per van by the office)
+  const editId = params.get('edit') || null; let editDoc = null;
+  if (editId) {
+    const sm = new Summary(params.get('day') || Fmt.today());
+    editDoc = sm.docs('invoice').find(x => x.id === editId) || null;
+    if (!editDoc || editDoc.deleted) { toastLong('الفاتورة غير موجودة'); Nav.finish(); return; }
+    if (!mm.allowed('السماح بتعديل فاتورة', false)) { toastLong('تعديل الفواتير غير مسموح لهذه السيارة'); Nav.finish(); return; }
+  }
+  const S = screen(editDoc ? 'تعديل الفاتورة ' + str(editDoc.json, 'number') : 'فاتورة جديدة'); const b = S.body;
+  let customer = null; const lines = []; let credit = false; let day = editDoc ? (params.get('day') || Fmt.today()) : Fmt.today(); let saved = false;
+  let reasonEdit = null;
+  if (editDoc) {
+    b.append(ui.banner('✏ تعديل فاتورة محفوظة. يبقى رقمها وتاريخها؛ غيّر العميل أو النوع أو الأصناف أو المدفوع ثم احفظ مع كتابة السبب.', C.warn, C.warnSoft));
+    const [rb, re] = ui.field('سبب التعديل (مطلوب)'); re.id = 'sale-reason'; b.append(rb); reasonEdit = re;
+  }
+  if (!editDoc && (mm.allowed('اختيار التاريخ للمبيعات', false) || mm.allowed('السماح بإدخال فاتورة بتاريخ سابق', false))) {
     const [db, dt] = ui.chooser('التاريخ', Fmt.pretty(day), () => pickDay(day, mm.intSetting('عدد الأيام المسموح الرجوع لها', 3), d => { day = d; dt.setValue(Fmt.pretty(d)); }));
     b.append(db);
   }
@@ -1497,8 +1533,8 @@ Screens.sale = function (_, params) {
   const [paidBox, paidEdit] = ui.field('المدفوع الآن (د.ا)', '', 'number', '0'); paidEdit.id = 'sale-paid'; b.append(paidBox);
   const totalText = ui.text('', 22, true, C.primary, true); totalText.style.padding = '10px 0 4px'; totalText.id = 'sale-total'; b.append(totalText);
   const f = ui.hbox(); f.style.gap = '6px';
-  const bPrint = grow(ui.button('حفظ وطباعة', 0, () => save(true))); bPrint.id = 'sale-save-print';
-  const bSave = grow(ui.button('حفظ فقط', 1, () => save(false))); bSave.id = 'sale-save';
+  const bPrint = grow(ui.button(editDoc ? 'حفظ التعديل وطباعة' : 'حفظ وطباعة', 0, () => save(true))); bPrint.id = 'sale-save-print';
+  const bSave = grow(ui.button(editDoc ? 'حفظ التعديل' : 'حفظ فقط', 1, () => save(false))); bSave.id = 'sale-save';
   f.append(bPrint, bSave); S.showFooter(f);
 
   function pickCustomer() {
@@ -1510,7 +1546,9 @@ Screens.sale = function (_, params) {
     custText.setValue(c.number + ' · ' + c.name);
     custInfo.style.display = '';
     const lim = c.creditLimit != null ? ' · السقف ' + Fmt.money(c.creditLimit) : '';
-    custInfo.textContent = (c.cashOnly ? 'عميل نقدي — البيع له نقداً فقط' : 'رصيده ' + Fmt.money(c.totalDue) + lim) + (c.chequesPending > 0 ? ' · شيكات ' + Fmt.money(c.chequesPending) : '');
+    custInfo.textContent = c.cashOnly ? 'عميل نقدي — البيع له نقداً فقط'
+      : c.chequesPending > 0 ? 'ذمته قبل تحصيل الشيكات ' + Fmt.money(c.totalDue) + ' · شيكات ' + Fmt.money(c.chequesPending) + ' · بعدها ' + Fmt.money(c.balance) + lim
+      : 'رصيده ' + Fmt.money(c.totalDue) + lim;
     if (c.cashOnly) credit = false;
     refresh();
   }
@@ -1583,6 +1621,7 @@ Screens.sale = function (_, params) {
   }
   async function doSave(c, tot, paid, printIt) {
     if (saved) return;
+    if (editDoc) return doEdit(c, tot, paid, printIt);
     const number = Store.takeNumber('invoice');
     if (!number) { info('لا توجد أرقام فواتير', 'اتصل بالإنترنت واضغط «مزامنة» ليصلك رقم جديد من المكتب، ثم احفظ.'); return; }
     saved = true; S.hideFooter();
@@ -1601,8 +1640,39 @@ Screens.sale = function (_, params) {
     toast('حُفظت الفاتورة ' + number);
     if (printIt) printSlip(bmp, () => Nav.finish(), 'invoice-' + number); else Nav.finish();
   }
+  /** the edited invoice goes to the database as one change (app_update_invoice); the phone shows it at once */
+  async function doEdit(c, tot, paid, printIt) {
+    const reason = reasonEdit ? reasonEdit.value.trim() : '';
+    if (!reason) { reasonEdit.setError('اكتب سبب التعديل'); toast('اكتب سبب التعديل'); return; }
+    saved = true; S.hideFooter();
+    const j = editDoc.json; const number = str(j, 'number');
+    const arr = lines.map(l => ({ item: l.item.name, item_id: l.item.id, qty: Fmt.round3(l.qty), price: l.price }));
+    const p = { id: editDoc.id, number, day, time: str(j, 'time') || Fmt.time(), customer_id: c.id, customer_name: c.name, customer_number: c.number,
+      receipt_type: credit ? 'ذمم' : 'نقدي', lines: arr, paid, prev_balance: num(j.prev_balance), printed_at: str(j, 'printed_at') || Fmt.now(), reason, total: tot };
+    try {
+      // an invoice still on the phone only: change it in place; a sent one: queue the change
+      const own = Store.out(editDoc.id);
+      if (own && own.kind === 'invoice' && own.status !== Store.SENT) { own.title = number + ' · ' + c.name; own.amount = tot; own.status = Store.PENDING; own.error = null; await Store.updatePayload(editDoc.id, Object.assign({}, own.payload, p, { reason: undefined })); }
+      else await Store.add('edit_invoice', 'edit-' + editDoc.id + '-' + Date.now(), day, number + ' · ' + c.name, tot, p);
+    } catch (e) { saved = false; S.showFooter(f); info('لم يُحفظ التعديل', errText(e)); return; }
+    lines.forEach(l => Prefs.rememberPrice(c.id, l.item.name, l.price));
+    await logoReady;
+    const bmp = Docs.invoice(mm, p, true);
+    if (mm.allowed('رفع صورة الفاتورة إلى OneDrive', true)) { try { await Store.dropPhotos(editDoc.id); await keepReceiptImage('invoice', editDoc.id, day, number + ' · ' + c.name, await canvasBlob(Docs.invoice(mm, p))); } catch (e) {} }
+    Sync.run(false);
+    toast('حُفظ تعديل الفاتورة ' + number);
+    if (printIt) printSlip(bmp, () => Nav.finish(), 'invoice-' + number); else Nav.finish();
+  }
   const cid = toIntOrNull(params.get('c'));
   if (cid) { const c = mm.customer(cid); if (c) setCustomer(c); }
+  if (editDoc) {
+    const j = editDoc.json; const c = mm.customer(num(j.customer_id)) || mm.customers.find(x => x.name === str(j, 'customer_name'));
+    if (c) setCustomer(c);
+    credit = str(j, 'receipt_type') === 'ذمم';
+    for (const l of (j.lines || [])) { const it = mm.item(str(l, 'item')); if (it) lines.push({ item: it, qty: Fmt.round3(num(l.qty)), price: num(l.price) }); else toastLong('الصنف ' + str(l, 'item') + ' لم يعد موجوداً — أُسقط من الفاتورة'); }
+    const p0 = editDoc.local ? j : serverInvoiceOf(j, day);
+    paidEdit.value = credit ? String(Fmt.round2(num(p0.paid))) : '';
+  }
   refresh();
   if (!customer) pickCustomer();
 };
@@ -1613,10 +1683,23 @@ Screens.collection = function (_, params) {
   const mm = Master.load();
   if (!mm) { toastLong('زامن أولاً'); Nav.finish(); return; }
   const methods = ['تسديد ذمم سابقة', 'نقدي', 'تحويل بنكي (كليك)', 'شيك'];
-  let customer = null, method = 0, saved = false; const day = Fmt.today(); let due = Fmt.today();
-  const S = screen('سند قبض'); const b = S.body;
+  const editId = params.get('edit') || null; let editDoc = null;
+  if (editId) {
+    const sm = new Summary(params.get('day') || Fmt.today());
+    editDoc = sm.docs('collection').find(x => x.id === editId) || null;
+    if (!editDoc || editDoc.deleted) { toastLong('السند غير موجود'); Nav.finish(); return; }
+    if (!mm.allowed('السماح بتعديل سند قبض', false)) { toastLong('تعديل السندات غير مسموح لهذه السيارة'); Nav.finish(); return; }
+  }
+  let customer = null, method = 0, saved = false; const day = editDoc ? (params.get('day') || Fmt.today()) : Fmt.today(); let due = Fmt.today();
+  const S = screen(editDoc ? 'تعديل سند قبض' : 'سند قبض'); const b = S.body;
+  let reasonEdit = null;
+  if (editDoc) {
+    b.append(ui.banner('✏ تعديل سند محفوظ: المبلغ أو نوع التسديد أو بيانات الشيك. يبقى رقمه وتاريخه وعميله.', C.warn, C.warnSoft));
+    const [rb, re] = ui.field('سبب التعديل (مطلوب)'); re.id = 'col-reason'; b.append(rb); reasonEdit = re;
+  }
   const setCustomer = c => { customer = c; custText.setValue(c.number + ' · ' + c.name); infoT.textContent = 'رصيده ' + Fmt.money(c.totalDue); infoT.style.display = ''; };
   const [cb, custText] = ui.chooser('العميل', '', () => {
+    if (editDoc) { toast('العميل لا يتغير في التعديل — احذف السند وأنشئ غيره'); return; }
     const cs = mm.customers;
     choose('اختر العميل', cs.map(c => c.number + ' · ' + c.name + (c.totalDue !== 0 ? '  — ' + Fmt.money(c.totalDue) : '')), i => setCustomer(cs[i]));
   });
@@ -1640,16 +1723,26 @@ Screens.collection = function (_, params) {
   b.append(ib, ob);
   const cid = toIntOrNull(params.get('c')); if (cid) { const c = mm.customer(cid); if (c) setCustomer(c); }
   const f = ui.hbox(); f.style.gap = '6px';
-  const b1 = grow(ui.button('حفظ وطباعة', 0, () => save(true))); b1.id = 'col-save-print';
-  const b2 = grow(ui.button('حفظ فقط', 1, () => save(false))); b2.id = 'col-save';
+  const b1 = grow(ui.button(editDoc ? 'حفظ التعديل وطباعة' : 'حفظ وطباعة', 0, () => save(true))); b1.id = 'col-save-print';
+  const b2 = grow(ui.button(editDoc ? 'حفظ التعديل' : 'حفظ فقط', 1, () => save(false))); b2.id = 'col-save';
   f.append(b1, b2); S.showFooter(f);
+  if (editDoc) {
+    const j = editDoc.json;
+    const c = mm.customer(num(j.customer_id)) || mm.customers.find(x => x.name === str(j, 'customer_name'));
+    if (c) setCustomer(c); else { custText.setValue(str(j, 'customer_name')); }
+    amount.value = String(Fmt.round2(num(j.amount)));
+    method = Math.max(0, methods.indexOf(str(j, 'method'))); paint(); chqBox.style.display = method === 3 ? '' : 'none';
+    if (str(j, 'cheque_no')) chqNo.value = str(j, 'cheque_no'); if (str(j, 'due_on')) { due = str(j, 'due_on'); dueText.setValue(Fmt.pretty(due)); }
+    inv.value = str(j, 'invoice_number'); note.value = (str(j, 'note') || '').split(' · ')[0] || '';
+  }
 
   async function save(printIt) {
     if (saved) return;
-    const c = customer; if (!c) { toast('اختر العميل'); return; }
+    const c = customer; if (!c && !editDoc) { toast('اختر العميل'); return; }
     const amt = Fmt.parse(amount.value);
     if (amt === null || amt <= 0) { toast('اكتب المبلغ'); return; }
     if (method === 3 && !chqNo.value.trim()) { toast('اكتب رقم الشيك'); return; }
+    if (editDoc) return doEdit(amt, printIt);
     const number = Store.takeNumber('voucher');
     if (!number) { info('لا توجد أرقام سندات', 'اتصل بالإنترنت واضغط «مزامنة» ثم احفظ.'); return; }
     saved = true; S.hideFooter();
@@ -1664,6 +1757,26 @@ Screens.collection = function (_, params) {
     Sync.run(false);
     toast('حُفظ السند ' + number);
     if (printIt) printSlip(bmp, () => Nav.finish(), 'voucher-' + number); else Nav.finish();
+  }
+  /** the edited voucher: in place while it is still on the phone only, otherwise queued as a change for the database */
+  async function doEdit(amt, printIt) {
+    const reason = reasonEdit.value.trim();
+    if (!reason) { reasonEdit.setError('اكتب سبب التعديل'); toast('اكتب سبب التعديل'); return; }
+    saved = true; S.hideFooter();
+    const j = editDoc.json; const number = str(j, 'number');
+    const p = { id: editDoc.id, number, day, time: str(j, 'time') || Fmt.time(), customer_id: num(j.customer_id) || (customer ? customer.id : null), customer_name: str(j, 'customer_name'),
+      amount: amt, method: methods[method], invoice_number: inv.value.trim(), note: note.value.trim(), prev_balance: num(j.prev_balance), reason };
+    if (method === 3) { p.cheque_no = chqNo.value.trim(); p.due_on = due; p.bank = bank.value.trim(); }
+    try {
+      const own = Store.out(editDoc.id);
+      if (own && own.kind === 'collection' && own.status !== Store.SENT) { own.amount = amt; own.status = Store.PENDING; own.error = null; await Store.updatePayload(editDoc.id, Object.assign({}, own.payload, p, { reason: undefined })); }
+      else await Store.add('edit_collection', 'editc-' + editDoc.id + '-' + Date.now(), day, (number ? number + ' · ' : '') + str(j, 'customer_name'), amt, p);
+    } catch (e) { saved = false; S.showFooter(f); info('لم يُحفظ التعديل', errText(e)); return; }
+    await logoReady;
+    const bmp = Docs.voucher(mm, p);
+    Sync.run(false);
+    toast('حُفظ تعديل السند');
+    if (printIt) printSlip(bmp, () => Nav.finish(), 'voucher-' + (number || editDoc.id.slice(0, 8))); else Nav.finish();
   }
 };
 
@@ -1683,7 +1796,13 @@ Screens.customers = function (mode) {
   const list = ui.vbox(); list.id = 'cust-list'; b.append(list);
   function fill() {
     const mm = Master.load(); if (!mm) return;
-    totalRow.innerHTML = ''; totalRow.append(ui.row('مجموع ذمم عملائي', Fmt.money(mm.customers.reduce((a, c) => a + c.totalDue, 0)), true, C.primary));
+    totalRow.innerHTML = '';
+    const tBefore = mm.customers.reduce((a, c) => a + c.totalDue, 0), tChq = mm.customers.reduce((a, c) => a + c.chequesPending, 0), tAfter = mm.customers.reduce((a, c) => a + c.balance, 0);
+    totalRow.append(ui.row('مجموع الذمم قبل تحصيل الشيكات', Fmt.money(tBefore), true, C.primary));
+    if (tChq > 0.005) {
+      totalRow.append(ui.row('شيكات غير محصلة', Fmt.money(tChq), false, C.blue, 14));
+      totalRow.append(ui.row('مجموع الذمم بعد تحصيل الشيكات', Fmt.money(tAfter), true, C.primary));
+    }
     list.innerHTML = '';
     const k = nameKey(q);
     const cs = mm.customers.filter(c => !k || nameKey(c.name).includes(k) || String(c.number) === q.trim());
@@ -1696,7 +1815,7 @@ Screens.customers = function (mode) {
       const tags = ui.hbox(); tags.style.paddingTop = '4px'; tags.style.flexWrap = 'wrap'; tags.style.rowGap = '4px';
       tags.append(c.cashOnly ? ui.pill('نقدي', C.ok, C.okSoft) : ui.pill('ذمم', C.warn, C.warnSoft));
       if (c.creditLimit != null && c.creditLimit > 0 && c.totalDue > c.creditLimit) tags.append(m(ui.pill('فوق السقف', C.bad, C.badSoft), { start: 6 }));
-      if (c.chequesPending > 0) tags.append(m(ui.pill('شيكات ' + Fmt.money(c.chequesPending), C.blue, C.blueSoft), { start: 6 }));
+      if (c.chequesPending > 0) { tags.append(m(ui.pill('شيكات ' + Fmt.money(c.chequesPending), C.blue, C.blueSoft), { start: 6 })); tags.append(m(ui.pill('بعد الشيكات ' + Fmt.money(c.balance), c.balance > 0.005 ? C.warn : C.ok, c.balance > 0.005 ? C.warnSoft : C.okSoft), { start: 6 })); }
       if (c.lastPayment) tags.append(ui.text('  آخر دفعة ' + Fmt.pretty(c.lastPayment), 12, false, C.muted));
       card.append(tags);
       list.append(card);
@@ -1738,7 +1857,12 @@ Screens.customers = function (mode) {
       printRows.push([str(x, 'day').slice(-5).replace('-', '/') + ' ' + str(x, 'ref'), d > 0 ? Fmt.plainMoney(d) : '', cr > 0 ? Fmt.plainMoney(cr) : '', Fmt.plainMoney(bal)]);
     }
     box.append(ui.divider());
-    box.append(ui.row('الرصيد الحالي', Fmt.money(bal), true, bal > 0.005 ? C.bad : C.ok, 17));
+    const chq = num(cu.cheques_pending);
+    if (chq > 0.005) {
+      box.append(ui.row('الذمة قبل تحصيل الشيكات', Fmt.money(bal + chq), true, bal + chq > 0.005 ? C.bad : C.ok, 16));
+      box.append(ui.row('شيكات برسم التحصيل', Fmt.money(chq), false, C.blue, 14));
+      box.append(ui.row('الذمة بعد تحصيل الشيكات', Fmt.money(bal), true, bal > 0.005 ? C.bad : C.ok, 17));
+    } else box.append(ui.row('الرصيد الحالي', Fmt.money(bal), true, bal > 0.005 ? C.bad : C.ok, 17));
     Dlg.show({ title: 'كشف حساب', content: box, buttons: [
       { label: 'طباعة', role: 'pos', click: async () => {
         await logoReady;
@@ -1746,7 +1870,8 @@ Screens.customers = function (mode) {
         s.pair('العميل', c.name, s.bold, s.bold).pair('من', Fmt.pretty(str(r, 'from'))).pair('إلى', Fmt.pretty(str(r, 'to')));
         s.pair('الرصيد السابق', Fmt.plainMoney(num(cu.opening))).divider(false);
         s.table(['البيان', 'مدين', 'دائن', 'الرصيد'], printRows, [0.2, 0.16, 0.16]);
-        s.box('الرصيد', Fmt.plainMoney(bal));
+        if (chq > 0.005) { s.pair('الذمة قبل تحصيل الشيكات', Fmt.plainMoney(bal + chq)).pair('شيكات برسم التحصيل', Fmt.plainMoney(chq)); s.box('الذمة بعد تحصيل الشيكات', Fmt.plainMoney(bal)); }
+        else s.box('الرصيد', Fmt.plainMoney(bal));
         printSlip(s.bitmap(), null, 'statement-' + c.number);
       } },
       { label: 'إغلاق', role: 'neg' }] });
@@ -2025,6 +2150,7 @@ Screens.list = function (mode) {
     const tags = ui.hbox(); tags.style.paddingTop = '4px'; tags.style.gap = '6px';
     tags.append(grow(ui.text(d.sub, 13, false, C.muted)));
     if (d.deleted) tags.append(ui.pill('محذوفة', C.bad, C.badSoft));
+    else if (d.edited && d.status === Store.PENDING) tags.append(ui.pill('✏ تعديل لم يُرسل', C.warn, C.warnSoft));
     else if (d.status === Store.PENDING) tags.append(ui.pill('⏳ لم تُرسل', C.warn, C.warnSoft));
     else if (d.status === Store.FAILED) tags.append(ui.pill('⚠ مرفوضة', C.bad, C.badSoft));
     else tags.append(ui.pill('✓', C.ok, C.okSoft));
@@ -2052,26 +2178,68 @@ Screens.list = function (mode) {
       Photo.take(d.kind, d.id, str(d.json, 'day') || day, d.title, false, fill);
       return;
     }
+    const canEdit = key => !d.deleted && mm && mm.allowed(key, false) && day >= Fmt.daysBack(Fmt.today(), mm.intSetting('عدد الأيام المسموح الرجوع لها', 3));
     if (d.kind === 'invoice') {
       const p = d.local ? d.json : serverInvoice(d.json);
-      const opts = ['🖨 إعادة طباعة'];
-      if (!d.deleted && mm && mm.allowed('السماح بحذف فاتورة', false)) opts.push('🗑 حذف الفاتورة');
-      choose(d.title, opts, async i => {
-        if (i === 0) { await logoReady; printSlip(Docs.invoice(mm, p, true), null, 'invoice-' + str(p, 'number')); }
-        else ask('حذف الفاتورة', 'سبب الحذف (مطلوب)', 'text', '', async reason => {
+      const acts = [['👁 عرض التفاصيل', () => showInvoice(d, p)], ['🖨 إعادة طباعة', async () => { await logoReady; printSlip(Docs.invoice(mm, p, true), null, 'invoice-' + str(p, 'number')); }]];
+      if (canEdit('السماح بتعديل فاتورة')) acts.push(['✏ تعديل الفاتورة', () => Nav.go('/sale?edit=' + d.id + '&day=' + day)]);
+      if (!d.deleted && mm && mm.allowed('السماح بحذف فاتورة', false)) acts.push(['🗑 حذف الفاتورة', () => ask('حذف الفاتورة', 'سبب الحذف (مطلوب)', 'text', '', async reason => {
           if (!reason) { toast('اكتب السبب'); return; }
           await Store.add('delete_invoice', 'del-' + d.id, day, 'حذف ' + d.title, 0, { id: d.id, reason });
           const e = await Sync.run(true); toast(e || 'حُذفت الفاتورة'); fill();
-        });
-      });
+        })]);
+      choose(d.title, acts.map(a => a[0]), i => acts[i][1]());
       return;
     }
     if (d.kind === 'collection') {
       const p = d.local ? d.json : Object.assign(JSON.parse(JSON.stringify(d.json)), { day });
-      choose(d.title, ['🖨 إعادة طباعة'], async () => { await logoReady; printSlip(Docs.voucher(mm, p), null, 'voucher-' + str(p, 'number')); });
+      const acts = [['👁 عرض التفاصيل', () => showVoucher(d, p)], ['🖨 إعادة طباعة', async () => { await logoReady; printSlip(Docs.voucher(mm, p), null, 'voucher-' + str(p, 'number')); }]];
+      if (canEdit('السماح بتعديل سند قبض')) {
+        acts.push(['✏ تعديل السند (المبلغ / نوع التسديد)', () => Nav.go('/collection?edit=' + d.id + '&day=' + day)]);
+        acts.push(['🗑 حذف السند', () => ask('حذف السند', 'سبب الحذف (مطلوب)', 'text', '', async reason => {
+          if (!reason) { toast('اكتب السبب'); return; }
+          await Store.add('delete_collection', 'delc-' + d.id, day, 'حذف ' + d.title, 0, { id: d.id, reason });
+          const e = await Sync.run(true); toast(e || 'حُذف السند'); fill();
+        })]);
+      }
+      choose(d.title, acts.map(a => a[0]), i => acts[i][1]());
     }
   }
-  function serverInvoice(j) {
+  /** the invoice as a readable sheet: who, what, how much, what was paid */
+  function showInvoice(d, p) {
+    const box = ui.vbox(); const tot = Docs.invoiceTotal(p);
+    const kv = (k, v, strong) => { const r = ui.hbox(); r.style.padding = '3px 0'; r.append(grow(ui.text(k, 13.5, false, C.muted))); const t = ui.text(v, 14, !!strong); t.dir = 'auto'; r.append(t); return r; };
+    box.append(kv('العميل', str(p, 'customer_name'), true), kv('النوع', str(p, 'receipt_type')), kv('التاريخ', Fmt.pretty(str(p, 'day') || day) + (str(p, 'time') ? ' ' + str(p, 'time') : '')));
+    box.append(ui.section('الأصناف'));
+    for (const l of (p.lines || [])) {
+      const r = ui.hbox(); r.style.padding = '5px 0'; r.style.borderBottom = '1px solid ' + C.line;
+      r.append(grow(ui.text(str(l, 'item'), 14.5, true)));
+      const a = ui.text(Fmt.kg(num(l.qty)) + ' × ' + Fmt.money3(num(l.price)) + ' = ' + Fmt.money(Fmt.round2(num(l.qty) * num(l.price))), 13.5); a.dir = 'ltr'; r.append(a);
+      box.append(r);
+    }
+    box.append(kv('الاجمالي', Fmt.money(tot) + ' د.ا', true));
+    if (p.paid != null) box.append(kv('المدفوع', Fmt.money(num(p.paid)) + ' د.ا'), kv('المتبقي على الفاتورة', Fmt.money(Fmt.round2(tot - num(p.paid))) + ' د.ا'));
+    if (d.edited) box.append(ui.text('✏ عُدّلت من هذا الهاتف' + (d.status === Store.PENDING ? ' — لم يُرسل التعديل بعد' : ''), 12.5, true, C.warn));
+    if (d.deleted) box.append(ui.text('🗑 محذوفة', 12.5, true, C.bad));
+    Dlg.show({ title: 'فاتورة ' + str(p, 'number'), content: box, buttons: [{ label: 'إغلاق', role: 'pos' }] });
+  }
+  function showVoucher(d, p) {
+    const box = ui.vbox();
+    const kv = (k, v, strong) => { const r = ui.hbox(); r.style.padding = '4px 0'; r.append(grow(ui.text(k, 13.5, false, C.muted))); const t = ui.text(v, 14.5, !!strong); t.dir = 'auto'; r.append(t); return r; };
+    box.append(kv('العميل', str(p, 'customer_name'), true), kv('المبلغ', Fmt.money(num(p.amount)) + ' د.ا', true), kv('نوع التسديد', str(p, 'method')), kv('التاريخ', Fmt.pretty(str(p, 'day') || day)));
+    if (str(p, 'invoice_number')) box.append(kv('عن فاتورة', str(p, 'invoice_number')));
+    if (str(p, 'cheque_no')) box.append(kv('رقم الشيك', str(p, 'cheque_no')), kv('الاستحقاق', Fmt.pretty(str(p, 'due_on'))), kv('حالة الشيك', str(p, 'cheque_status') || 'برسم التحصيل'));
+    if (str(p, 'note')) box.append(kv('ملاحظة', str(p, 'note')));
+    if (d.edited) box.append(ui.text('✏ عُدّل من هذا الهاتف' + (d.status === Store.PENDING ? ' — لم يُرسل التعديل بعد' : ''), 12.5, true, C.warn));
+    if (d.deleted) box.append(ui.text('🗑 محذوف', 12.5, true, C.bad));
+    Dlg.show({ title: 'سند قبض ' + (str(p, 'number') || ''), content: box, buttons: [{ label: 'إغلاق', role: 'pos' }] });
+  }
+  const serverInvoice = j => serverInvoiceOf(j, day);
+  fill();
+};
+/** a database invoice in the shape the slip and the forms use (the payment taken with it comes from the day's collections) */
+function serverInvoiceOf(j, day) {
+  {
     const p = Object.assign(JSON.parse(JSON.stringify(j)), { day, lines: j.lines || [] });
     const mm = Master.load(); const c = mm ? mm.customer(num(j.customer_id)) : null;
     if (c) p.customer_number = c.number;
@@ -2085,8 +2253,7 @@ Screens.list = function (mode) {
     }
     return p;
   }
-  fill();
-};
+}
 
 // ------------------------------------------------------------------ الإيداع والبنك
 /** The van's bank position: what came in, what went to the bank, what is still outside. */
